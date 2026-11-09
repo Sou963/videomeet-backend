@@ -3,6 +3,7 @@ import Meeting from "../models/Meeting.js";
 import Message from "../models/Message.js";
 
 const MAX_PARTICIPANTS = 4;
+const DISCONNECT_GRACE_PERIOD = 30000;
 const roomValue = (value) =>
   typeof value === "string" && value.length > 0 && value.length < 120
     ? value
@@ -37,6 +38,8 @@ function buildMemberList(io, room, excludeId) {
 }
 
 export function configureMeetingSocket(io) {
+  const pendingDepartures = new Map();
+
   // ── Authentication middleware ──────────────────────────────────────
   io.use((socket, next) => {
     try {
@@ -57,6 +60,14 @@ export function configureMeetingSocket(io) {
   });
 
   io.on("connection", (socket) => {
+    if (socket.recovered) {
+      const pendingDeparture = pendingDepartures.get(socket.id);
+      if (pendingDeparture) {
+        clearTimeout(pendingDeparture);
+        pendingDepartures.delete(socket.id);
+      }
+    }
+
     // ── Join room ────────────────────────────────────────────────────
     // Both "join-room" and "join-meeting" map to the same handler so
     // the MeetingRoom component and ChatPanel can share one socket.
@@ -217,10 +228,15 @@ export function configureMeetingSocket(io) {
     socket.on("disconnect", () => {
       const room = socket.data.room;
       if (room) {
-        socket.to(room).emit("peer-left", {
-          peerId: socket.id,
-          name: socket.data.name || "Participant",
-        });
+        const timer = setTimeout(() => {
+          pendingDepartures.delete(socket.id);
+          io.to(room).except(socket.id).emit("peer-left", {
+            peerId: socket.id,
+            name: socket.data.name || "Participant",
+          });
+        }, DISCONNECT_GRACE_PERIOD);
+        timer.unref();
+        pendingDepartures.set(socket.id, timer);
       }
     });
   });

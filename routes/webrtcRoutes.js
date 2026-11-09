@@ -10,8 +10,9 @@ router.use(requireAuth);
  * Returns the ICE server configuration the client needs
  * to create RTCPeerConnection instances.
  *
- * Always includes a public Google STUN server.
- * If TURN_URL is configured on the backend, a TURN entry is added.
+ * Always includes a public Google STUN server. Configure TURN_URL,
+ * TURN_USERNAME, and TURN_CREDENTIAL for reliable connections across
+ * restrictive NATs and firewalls.
  */
 router.get("/ice-servers", (req, res) => {
   const iceServers = [{ urls: "stun:stun.l.google.com:19302" }];

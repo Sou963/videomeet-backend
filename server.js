@@ -31,7 +31,13 @@ const allowedOrigins = [
     .filter(Boolean),
 ];
 const corsOptions = { origin: allowedOrigins, credentials: true };
-const io = new Server(server, { cors: corsOptions });
+const io = new Server(server, {
+  cors: corsOptions,
+  pingTimeout: 60000,
+  connectionStateRecovery: {
+    maxDisconnectionDuration: 120000,
+  },
+});
 
 app.set("io", io);
 app.use(cors(corsOptions));
