@@ -60,6 +60,7 @@ export function configureMeetingSocket(io) {
   });
 
   io.on("connection", (socket) => {
+    console.info("[Socket] Connected", { socketId: socket.id });
     if (socket.recovered) {
       const pendingDeparture = pendingDepartures.get(socket.id);
       if (pendingDeparture) {
@@ -75,8 +76,10 @@ export function configureMeetingSocket(io) {
       const room = roomValue(meetingId);
       if (!room) return;
 
-      // Already in this room? skip.
-      if (socket.data.room === room) return;
+      if (socket.data.room === room) {
+        socket.emit("room-members", buildMemberList(io, room, socket.id));
+        return;
+      }
 
       // Verify the meeting exists and is active
       const meeting = await Meeting.findOne({ meetingId: room }).catch(
@@ -96,10 +99,23 @@ export function configureMeetingSocket(io) {
         return;
       }
 
+      if (socket.data.room) {
+        socket.leave(socket.data.room);
+        socket.to(socket.data.room).emit("peer-left", {
+          peerId: socket.id,
+          name: socket.data.name || "Participant",
+        });
+      }
+
       socket.data.room = room;
       socket.data.name = getSafeName(name);
       socket.data.meetingId = room;
       socket.join(room);
+      console.info("[Socket] Joined meeting", {
+        socketId: socket.id,
+        meetingId: room,
+        peerCount: existing.size + 1,
+      });
 
       // Tell the new joiner who else is already in the room
       const members = buildMemberList(io, room, socket.id);
@@ -121,6 +137,7 @@ export function configureMeetingSocket(io) {
     socket.on("leave-meeting", ({ meetingId } = {}) => {
       const room = roomValue(meetingId);
       if (!room) return;
+      if (socket.data.room !== room) return;
       socket.leave(room);
       socket.to(room).emit("peer-left", {
         peerId: socket.id,
@@ -134,7 +151,15 @@ export function configureMeetingSocket(io) {
     // Only forward if both sender and target belong to the same room.
     socket.on("webrtc-signal", ({ meetingId, targetId, signal } = {}) => {
       const room = roomValue(meetingId);
-      if (!room || !targetId || !signal) return;
+      if (
+        !room ||
+        !targetId ||
+        targetId === socket.id ||
+        !signal ||
+        !["offer", "answer", "candidate", "ice-restart-request"].includes(signal.type)
+      ) {
+        return;
+      }
 
       // Verify sender is in the room
       if (socket.data.room !== room) return;
@@ -143,6 +168,14 @@ export function configureMeetingSocket(io) {
       const targetSocket = io.sockets.sockets.get(targetId);
       if (!targetSocket || targetSocket.data.room !== room) return;
 
+      if (signal.type !== "candidate") {
+        console.debug("[Socket] Forwarding WebRTC signal", {
+          meetingId: room,
+          from: socket.id,
+          to: targetId,
+          type: signal.type,
+        });
+      }
       targetSocket.emit("webrtc-signal", {
         from: socket.id,
         signal,
@@ -227,6 +260,7 @@ export function configureMeetingSocket(io) {
     // ── Disconnect ───────────────────────────────────────────────────
     socket.on("disconnect", () => {
       const room = socket.data.room;
+      console.info("[Socket] Disconnected", { socketId: socket.id, meetingId: room || null });
       if (room) {
         const timer = setTimeout(() => {
           pendingDepartures.delete(socket.id);

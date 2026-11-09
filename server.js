@@ -16,7 +16,7 @@ import authRoutes from "./routes/authRoutes.js";
 import meetingRoutes from "./routes/meetingRoutes.js";
 import messageRoutes from "./routes/messageRoutes.js";
 import userRoutes from "./routes/userRoutes.js";
-import webrtcRoutes from "./routes/webrtcRoutes.js";
+import webrtcRoutes, { isTurnConfigured } from "./routes/webrtcRoutes.js";
 import geminiRoutes from "./routes/geminiRoutes.js";
 import { notFound, errorHandler } from "./middleware/errorMiddleware.js";
 import { configureMeetingSocket } from "./socket/meetingSocket.js";
@@ -49,11 +49,7 @@ app.get("/api/health", (req, res) =>
     data: {
       status: "ok",
       webrtc: {
-        turnConfigured: Boolean(
-          process.env.TURN_URL &&
-          process.env.TURN_USERNAME &&
-          process.env.TURN_CREDENTIAL
-        ),
+        turnConfigured: isTurnConfigured(),
       },
     },
   })

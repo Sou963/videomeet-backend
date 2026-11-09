@@ -25,3 +25,5 @@ services:
         sync: false
       - key: TURN_CREDENTIAL
         sync: false
+      - key: TURN_SHARED_SECRET
+        sync: false
