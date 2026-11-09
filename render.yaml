@@ -18,7 +18,7 @@ services:
       - key: GEMINI_API_KEY
         sync: false
       - key: CLIENT_URL
-        value: https://videomeet-2-o-jqxa.onrender.com,http://localhost:3000
+        value: https://videomeet-2-o-k5ui.onrender.com,https://videomeet-2-o-jqxa.onrender.com,http://localhost:3000
       - key: TURN_URL
         sync: false
       - key: TURN_USERNAME

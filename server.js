@@ -24,6 +24,7 @@ import { configureMeetingSocket } from "./socket/meetingSocket.js";
 const app = express();
 const server = http.createServer(app);
 const allowedOrigins = [
+  "https://videomeet-2-o-k5ui.onrender.com",
   "https://videomeet-2-o-jqxa.onrender.com",
   ...(process.env.CLIENT_URL || "http://localhost:3000")
     .split(",")
