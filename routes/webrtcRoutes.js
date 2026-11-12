@@ -1,9 +1,8 @@
 import { createHmac } from "node:crypto";
 import { Router } from "express";
-import { requireAuth } from "../middleware/authMiddleware.js";
+import { requireMeetingAccess } from "../middleware/meetingAccess.js";
 
 const router = Router();
-router.use(requireAuth);
 const TURN_CREDENTIAL_TTL_SECONDS = 60 * 60;
 
 export function isTurnConfigured(environment = process.env) {
@@ -67,7 +66,7 @@ export function getIceServerConfiguration(environment = process.env) {
  * TURN_USERNAME, and TURN_CREDENTIAL for reliable connections across
  * restrictive NATs and firewalls.
  */
-router.get("/ice-servers", (req, res) => {
+router.get("/ice-servers", requireMeetingAccess, (req, res) => {
   const configuration = getIceServerConfiguration();
   res.json({ success: true, data: configuration });
 });

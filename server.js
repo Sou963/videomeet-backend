@@ -23,6 +23,7 @@ import { configureMeetingSocket } from "./socket/meetingSocket.js";
 
 const app = express();
 const server = http.createServer(app);
+app.set("trust proxy", 1);
 const allowedOrigins = [
   "https://videomeet-2-o-k5ui.onrender.com",
   "https://videomeet-2-o-jqxa.onrender.com",

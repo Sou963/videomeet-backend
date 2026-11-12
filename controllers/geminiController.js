@@ -7,10 +7,7 @@ const SESSION_START_WINDOW_MS = 60 * 1000;
 
 export async function createLiveToken(req, res, next) {
   try {
-    const meetingId = typeof req.body.meetingId === "string" ? req.body.meetingId.trim() : "";
-    if (!meetingId) {
-      return res.status(400).json({ success: false, message: "Meeting ID is required." });
-    }
+    const meetingId = req.meetingAccess.meetingId;
 
     if (!process.env.GEMINI_API_KEY) {
       return res.status(503).json({
@@ -22,13 +19,12 @@ export async function createLiveToken(req, res, next) {
     const meeting = await Meeting.findOne({
       meetingId,
       status: { $ne: "ended" },
-      participants: req.user._id,
     }).select("_id");
 
     if (!meeting) {
       return res.status(403).json({
         success: false,
-        message: "Join this meeting before enabling translation.",
+        message: "Meeting access is no longer available.",
       });
     }
 
