@@ -18,6 +18,12 @@ router.get("/:meetingId/messages", async (req, res, next) => {
 
 router.post("/:meetingId/messages", async (req, res, next) => {
   try {
+    if (!["active", "scheduled"].includes(req.meeting.status)) {
+      return res.status(409).json({
+        success: false,
+        message: "Messages cannot be sent after the host ends the meeting",
+      });
+    }
     const text = typeof req.body.message === "string" ? req.body.message.trim() : "";
     if (!text || text.length > 1500) {
       return res.status(400).json({ success: false, message: "Message must be 1 to 1500 characters" });

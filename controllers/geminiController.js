@@ -18,7 +18,7 @@ export async function createLiveToken(req, res, next) {
 
     const meeting = await Meeting.findOne({
       meetingId,
-      status: { $ne: "ended" },
+      status: { $in: ["active", "scheduled"] },
     }).select("_id");
 
     if (!meeting) {

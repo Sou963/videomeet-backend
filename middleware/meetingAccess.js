@@ -5,7 +5,7 @@ function getMeetingId(req) {
   return req.params.meetingId || req.body?.meetingId || req.query.meetingId;
 }
 
-export async function requireMeetingAccess(req, res, next) {
+async function verifyMeetingAccess(req, res, next, { allowDeactivated = false } = {}) {
   const token = req.headers.authorization?.match(/^Bearer (.+)$/i)?.[1];
   if (!token) {
     return res.status(401).json({ success: false, message: "Meeting access token required" });
@@ -30,7 +30,11 @@ export async function requireMeetingAccess(req, res, next) {
 
   try {
     const meeting = await Meeting.findOne({ meetingId });
-    if (!meeting || meeting.status === "ended" || meeting.status === "inactive") {
+    if (
+      !meeting ||
+      ["ended", "inactive"].includes(meeting.status) ||
+      (meeting.status === "deactivated" && !allowDeactivated)
+    ) {
       return res.status(404).json({ success: false, message: "Meeting not found or unavailable" });
     }
 
@@ -57,4 +61,12 @@ export async function requireMeetingAccess(req, res, next) {
   } catch (error) {
     return next(error);
   }
+}
+
+export function requireMeetingAccess(req, res, next) {
+  return verifyMeetingAccess(req, res, next);
+}
+
+export function requireMeetingStatusAccess(req, res, next) {
+  return verifyMeetingAccess(req, res, next, { allowDeactivated: true });
 }

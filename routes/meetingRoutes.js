@@ -4,17 +4,22 @@ import Meeting from "../models/Meeting.js";
 import generateMeetingId from "../utils/generateMeetingId.js";
 import { requireAuth } from "../middleware/authMiddleware.js";
 import { guestJoinRateLimit } from "../middleware/guestJoinRateLimit.js";
-import { requireMeetingAccess } from "../middleware/meetingAccess.js";
+import {
+  requireMeetingAccess,
+  requireMeetingStatusAccess,
+} from "../middleware/meetingAccess.js";
 import { issueMeetingAccessToken } from "../utils/meetingAccessToken.js";
 
 const router = Router();
 const MAX_PARTICIPANTS = 4;
+const MEETING_END_GRACE_MS = 5 * 60 * 1000;
+const isJoinable = (meeting) => ["active", "scheduled"].includes(meeting.status);
 
 // ── Public, non-sensitive meeting details for the pre-join screen ───
 router.get("/:meetingId/info", async (req, res, next) => {
   try {
     const meeting = await Meeting.findOne({ meetingId: req.params.meetingId })
-      .select("meetingId title status passwordHash");
+      .select("meetingId title status passwordHash hostEndedAt deactivateAt deactivatedAt");
     if (!meeting) {
       return res.status(404).json({ success: false, message: "Meeting not found" });
     }
@@ -26,6 +31,10 @@ router.get("/:meetingId/info", async (req, res, next) => {
           title: meeting.title,
           status: meeting.status,
           hasPassword: Boolean(meeting.passwordHash),
+          hostEndedAt: meeting.hostEndedAt || null,
+          deactivateAt: meeting.deactivateAt || null,
+          deactivatedAt: meeting.deactivatedAt || null,
+          serverNow: new Date().toISOString(),
         },
       },
     });
@@ -46,7 +55,7 @@ router.post("/:meetingId/guest-token", guestJoinRateLimit, async (req, res, next
     }
 
     const meeting = await Meeting.findOne({ meetingId: req.params.meetingId });
-    if (!meeting || meeting.status === "ended" || meeting.status === "inactive") {
+    if (!meeting || !isJoinable(meeting)) {
       return res.status(404).json({ success: false, message: "Meeting not found or unavailable" });
     }
     const password =
@@ -83,12 +92,31 @@ router.get("/:meetingId/session", requireMeetingAccess, (req, res) => {
         meetingId: meeting.meetingId,
         title: meeting.title,
         status: meeting.status,
+        hostEndedAt: meeting.hostEndedAt || null,
+        deactivateAt: meeting.deactivateAt || null,
+        deactivatedAt: meeting.deactivatedAt || null,
+        serverNow: new Date().toISOString(),
       },
       identity: {
         name: meetingAccess.name,
         role: meetingAccess.role,
         userId: meetingAccess.userId || null,
       },
+    },
+  });
+});
+
+router.get("/:meetingId/status", requireMeetingStatusAccess, (req, res) => {
+  const { meeting } = req;
+  return res.json({
+    success: true,
+    data: {
+      meetingId: meeting.meetingId,
+      status: meeting.status,
+      hostEndedAt: meeting.hostEndedAt || null,
+      deactivateAt: meeting.deactivateAt || null,
+      deactivatedAt: meeting.deactivatedAt || null,
+      serverNow: new Date().toISOString(),
     },
   });
 });
@@ -168,7 +196,7 @@ router.get("/:meetingId", async (req, res, next) => {
 router.post("/:meetingId/access-token", async (req, res, next) => {
   try {
     const meeting = await Meeting.findOne({ meetingId: req.params.meetingId });
-    if (!meeting || meeting.status === "ended" || meeting.status === "inactive") {
+    if (!meeting || !isJoinable(meeting)) {
       return res.status(404).json({ success: false, message: "Meeting not found or unavailable" });
     }
     if (!meeting.participants.some((id) => id.equals(req.user._id))) {
@@ -209,13 +237,19 @@ router.patch("/:meetingId/status", async (req, res, next) => {
     if (!meeting.hostId.equals(req.user._id)) {
       return res.status(403).json({ success: false, message: "Only the host can change this meeting's status" });
     }
-    if (meeting.status === "ended") {
+    const updatedMeeting = await Meeting.findOneAndUpdate(
+      {
+        meetingId: req.params.meetingId,
+        hostId: req.user._id,
+        status: { $nin: ["ended", "ending", "deactivated"] },
+      },
+      { $set: { status } },
+      { new: true }
+    );
+    if (!updatedMeeting) {
       return res.status(409).json({ success: false, message: "An ended meeting cannot be reactivated" });
     }
-
-    meeting.status = status;
-    await meeting.save();
-    res.json({ success: true, data: { meeting } });
+    return res.json({ success: true, data: { meeting: updatedMeeting } });
   } catch (error) {
     next(error);
   }
@@ -226,7 +260,7 @@ router.post("/:meetingId/join", async (req, res, next) => {
   try {
     const meeting = await Meeting.findOne({ meetingId: req.params.meetingId });
 
-    if (!meeting || meeting.status === "ended" || meeting.status === "inactive") {
+    if (!meeting || !isJoinable(meeting)) {
       return res.status(404).json({ success: false, message: "Meeting not found, inactive, or ended" });
     }
 
@@ -262,9 +296,9 @@ router.post("/:meetingId/join", async (req, res, next) => {
 });
 
 // ── End meeting (host only) ─────────────────────────────────────────
-router.delete("/:meetingId", async (req, res, next) => {
+async function endMeeting(req, res, next) {
   try {
-    const meeting = await Meeting.findOne({ meetingId: req.params.meetingId });
+    let meeting = await Meeting.findOne({ meetingId: req.params.meetingId });
     if (!meeting) {
       return res.status(404).json({ success: false, message: "Meeting not found" });
     }
@@ -272,15 +306,71 @@ router.delete("/:meetingId", async (req, res, next) => {
       return res.status(403).json({ success: false, message: "Only the host can end this meeting" });
     }
 
-    meeting.status = "ended";
-    meeting.endedAt = new Date();
-    await meeting.save();
+    if (meeting.status === "ending") {
+      return res.json({
+        success: true,
+        data: {
+          meetingId: meeting.meetingId,
+          status: meeting.status,
+          hostEndedAt: meeting.hostEndedAt,
+          deactivateAt: meeting.deactivateAt,
+          serverNow: new Date().toISOString(),
+        },
+      });
+    }
+    if (!["active", "scheduled", "inactive"].includes(meeting.status)) {
+      return res.status(409).json({ success: false, message: "This meeting can no longer be ended" });
+    }
 
-    req.app.get("io").to(meeting.meetingId).emit("meeting-ended");
-    res.json({ success: true, data: {} });
+    const hostEndedAt = new Date();
+    meeting = await Meeting.findOneAndUpdate(
+      {
+        meetingId: req.params.meetingId,
+        hostId: req.user._id,
+        status: { $in: ["active", "scheduled", "inactive"] },
+      },
+      {
+        $set: {
+          status: "ending",
+          hostEndedAt,
+          deactivateAt: new Date(hostEndedAt.getTime() + MEETING_END_GRACE_MS),
+        },
+      },
+      { new: true }
+    );
+
+    if (!meeting) {
+      meeting = await Meeting.findOne({ meetingId: req.params.meetingId });
+      if (meeting?.status === "ending" && meeting.hostId.equals(req.user._id)) {
+        return res.json({
+          success: true,
+          data: {
+            meetingId: meeting.meetingId,
+            status: meeting.status,
+            hostEndedAt: meeting.hostEndedAt,
+            deactivateAt: meeting.deactivateAt,
+            serverNow: new Date().toISOString(),
+          },
+        });
+      }
+      return res.status(409).json({ success: false, message: "Meeting status changed before it could be ended" });
+    }
+
+    const payload = {
+      meetingId: meeting.meetingId,
+      status: meeting.status,
+      hostEndedAt: meeting.hostEndedAt.toISOString(),
+      deactivateAt: meeting.deactivateAt.toISOString(),
+      serverNow: new Date().toISOString(),
+    };
+    req.app.get("io").to(meeting.meetingId).emit("meeting-ending", payload);
+    return res.json({ success: true, data: payload });
   } catch (error) {
-    next(error);
+    return next(error);
   }
-});
+}
+
+router.post("/:meetingId/end", endMeeting);
+router.delete("/:meetingId", endMeeting);
 
 export default router;

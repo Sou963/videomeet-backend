@@ -67,6 +67,12 @@ export function getIceServerConfiguration(environment = process.env) {
  * restrictive NATs and firewalls.
  */
 router.get("/ice-servers", requireMeetingAccess, (req, res) => {
+  if (!["active", "scheduled"].includes(req.meeting.status)) {
+    return res.status(409).json({
+      success: false,
+      message: "New WebRTC activities are unavailable after the host ends the meeting",
+    });
+  }
   const configuration = getIceServerConfiguration();
   res.json({ success: true, data: configuration });
 });

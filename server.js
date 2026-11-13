@@ -20,6 +20,7 @@ import webrtcRoutes, { isTurnConfigured } from "./routes/webrtcRoutes.js";
 import geminiRoutes from "./routes/geminiRoutes.js";
 import { notFound, errorHandler } from "./middleware/errorMiddleware.js";
 import { configureMeetingSocket } from "./socket/meetingSocket.js";
+import { startMeetingDeactivationScheduler } from "./services/meetingDeactivation.js";
 
 const app = express();
 const server = http.createServer(app);
@@ -69,7 +70,10 @@ configureMeetingSocket(io);
 console.info("Configuration loaded", { environmentPath });
 
 connectDatabase()
-  .then(() => server.listen(process.env.PORT || 5000, () => console.log(`API ready on ${process.env.PORT || 5000}`)))
+  .then(() => {
+    startMeetingDeactivationScheduler(io);
+    server.listen(process.env.PORT || 5000, () => console.log(`API ready on ${process.env.PORT || 5000}`));
+  })
   .catch((error) => {
     console.error("Database connection failed:", error.message);
     process.exit(1);

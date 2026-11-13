@@ -4,6 +4,21 @@ import Message from "../models/Message.js";
 
 const MAX_PARTICIPANTS = 4;
 const DISCONNECT_GRACE_PERIOD = 30000;
+function getMaxFileSize() {
+  const configuredMaxFileSizeMb = Number(process.env.MEETING_MAX_FILE_SIZE_MB);
+  const maxFileSizeMb =
+    Number.isSafeInteger(configuredMaxFileSizeMb) &&
+    configuredMaxFileSizeMb > 0 &&
+    configuredMaxFileSizeMb <= Number.MAX_SAFE_INTEGER / (1024 * 1024)
+      ? configuredMaxFileSizeMb
+      : 25;
+  return maxFileSizeMb * 1024 * 1024;
+}
+const FILE_CHUNK_SIZE = 32 * 1024;
+const TRANSFER_AUTH_TIMEOUT_MS = 30000;
+const TRANSFER_LIFETIME_MS = 10 * 60 * 1000;
+const TRANSFER_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const MIME_TYPE_PATTERN = /^[\w!#$&^_.+-]+\/[\w!#$&^_.+-]+$/;
 const roomValue = (value) =>
   typeof value === "string" && value.length > 0 && value.length < 120
     ? value
@@ -40,6 +55,52 @@ function buildMemberList(io, room, excludeId) {
 
 export function configureMeetingSocket(io) {
   const pendingDepartures = new Map();
+  const pendingTransfers = new Map();
+
+  function removeTransfersForPeer(peerId, meetingId) {
+    for (const [transferId, transfer] of pendingTransfers) {
+      if (
+        transfer.meetingId !== meetingId ||
+        (transfer.senderId !== peerId && transfer.receiverId !== peerId)
+      ) {
+        continue;
+      }
+      clearTimeout(transfer.authorizationTimer);
+      pendingTransfers.delete(transferId);
+      const otherId = transfer.senderId === peerId ? transfer.receiverId : transfer.senderId;
+      io.sockets.sockets.get(otherId)?.emit("file-transfer-failed", {
+        transferId,
+        message: "The other participant disconnected.",
+      });
+    }
+  }
+
+  async function hasActiveMembership(socket, meetingId) {
+    if (socket.data.room !== meetingId) return false;
+    let meeting;
+    try {
+      meeting = await Meeting.findOne({ meetingId });
+    } catch (error) {
+      console.error("[Socket] Could not verify meeting membership:", error);
+      socket.emit("socket-error", {
+        message: "Meeting membership could not be verified. Please retry.",
+      });
+      return false;
+    }
+    if (!meeting || !["active", "scheduled"].includes(meeting.status)) return false;
+
+    const access = socket.data.meetingAccess;
+    if (access.role === "guest") {
+      return !meeting.removedGuests.includes(access.guestId);
+    }
+    return (
+      meeting.participants.some((id) => id.equals(access.userId)) &&
+      !meeting.removedUsers.some((id) => id.equals(access.userId)) &&
+      (access.role === "host"
+        ? meeting.hostId.equals(access.userId)
+        : !meeting.hostId.equals(access.userId))
+    );
+  }
 
   // ── Authentication middleware ──────────────────────────────────────
   io.use((socket, next) => {
@@ -95,11 +156,11 @@ export function configureMeetingSocket(io) {
         return;
       }
 
-      // Verify the meeting exists and is active
+      // Verify the meeting exists and the access token still belongs to a member.
       const meeting = await Meeting.findOne({ meetingId: room }).catch(
         () => null
       );
-      if (!meeting || meeting.status === "ended" || meeting.status === "inactive") {
+      if (!meeting || ["ended", "inactive", "deactivated"].includes(meeting.status)) {
         socket.emit("socket-error", { message: "Meeting not found or unavailable" });
         return;
       }
@@ -122,6 +183,20 @@ export function configureMeetingSocket(io) {
         meeting.removedGuests.includes(access.guestId)
       ) {
         socket.emit("socket-error", { message: "You were removed from this meeting" });
+        return;
+      }
+
+      if (meeting.status === "ending") {
+        if (socket.data.room === room) {
+          socket.emit("meeting-ending", {
+            meetingId: room,
+            hostEndedAt: meeting.hostEndedAt?.toISOString(),
+            deactivateAt: meeting.deactivateAt?.toISOString(),
+            serverNow: new Date().toISOString(),
+          });
+        } else {
+          socket.emit("socket-error", { message: "This meeting is ending and cannot be joined" });
+        }
         return;
       }
 
@@ -160,6 +235,21 @@ export function configureMeetingSocket(io) {
       socket.data.room = room;
       socket.data.meetingId = room;
       socket.join(room);
+      let joinedMeeting;
+      try {
+        joinedMeeting = await Meeting.findOne({ meetingId: room }).select("status");
+      } catch (error) {
+        console.error("[Socket] Could not confirm meeting join status:", error);
+      }
+      if (!joinedMeeting || !["active", "scheduled"].includes(joinedMeeting.status)) {
+        socket.leave(room);
+        socket.data.room = null;
+        socket.data.meetingId = null;
+        socket.emit("socket-error", {
+          message: "This meeting is ending or unavailable and cannot be joined",
+        });
+        return;
+      }
       console.info("[Socket] Joined meeting", {
         socketId: socket.id,
         meetingId: room,
@@ -189,6 +279,7 @@ export function configureMeetingSocket(io) {
       if (!room) return;
       if (socket.data.room !== room) return;
       socket.leave(room);
+      removeTransfersForPeer(socket.id, room);
       socket.to(room).emit("peer-left", {
         peerId: socket.id,
         name: socket.data.name || "Participant",
@@ -214,7 +305,11 @@ export function configureMeetingSocket(io) {
 
       try {
         const meeting = await Meeting.findOne({ meetingId: room });
-        if (!meeting || !meeting.hostId.equals(socket.data.userId)) {
+        if (
+          !meeting ||
+          meeting.status !== "active" ||
+          !meeting.hostId.equals(socket.data.userId)
+        ) {
           socket.emit("socket-error", { message: "Only the meeting host can remove participants" });
           return;
         }
@@ -248,7 +343,7 @@ export function configureMeetingSocket(io) {
 
     // ── WebRTC signaling ─────────────────────────────────────────────
     // Only forward if both sender and target belong to the same room.
-    socket.on("webrtc-signal", ({ meetingId, targetId, signal } = {}) => {
+    socket.on("webrtc-signal", async ({ meetingId, targetId, signal } = {}) => {
       const room = roomValue(meetingId);
       if (
         !room ||
@@ -262,6 +357,7 @@ export function configureMeetingSocket(io) {
 
       // Verify sender is in the room
       if (socket.data.room !== room) return;
+      if (!(await hasActiveMembership(socket, room))) return;
 
       // Verify target is in the room
       const targetSocket = io.sockets.sockets.get(targetId);
@@ -286,9 +382,10 @@ export function configureMeetingSocket(io) {
     // ── Media status updates ─────────────────────────────────────────
     socket.on(
       "media-status",
-      ({ meetingId, audio, video, screenSharing } = {}) => {
+      async ({ meetingId, audio, video, screenSharing } = {}) => {
         const room = roomValue(meetingId);
         if (!room || socket.data.room !== room) return;
+        if (!(await hasActiveMembership(socket, room))) return;
         socket.to(room).emit("media-status", {
           peerId: socket.id,
           audio: Boolean(audio),
@@ -308,6 +405,7 @@ export function configureMeetingSocket(io) {
       if (socket.data.room !== room) return;
 
       try {
+        if (!(await hasActiveMembership(socket, room))) return;
         const item = await Message.create({
           meetingId: room,
           userId: socket.data.userId,
@@ -322,9 +420,10 @@ export function configureMeetingSocket(io) {
     });
 
     // ── Raise hand ───────────────────────────────────────────────────
-    socket.on("raise-hand", ({ meetingId, raised } = {}) => {
+    socket.on("raise-hand", async ({ meetingId, raised } = {}) => {
       const room = roomValue(meetingId);
       if (!room || socket.data.room !== room) return;
+      if (!(await hasActiveMembership(socket, room))) return;
       io.to(room).emit("raise-hand", {
         peerId: socket.id,
         userId: socket.data.userId,
@@ -334,9 +433,10 @@ export function configureMeetingSocket(io) {
     });
 
     // ── Reactions ────────────────────────────────────────────────────
-    socket.on("reaction", ({ meetingId, reaction } = {}) => {
+    socket.on("reaction", async ({ meetingId, reaction } = {}) => {
       const room = roomValue(meetingId);
       if (!room || socket.data.room !== room) return;
+      if (!(await hasActiveMembership(socket, room))) return;
       const allowed = ["👍", "❤️", "😂", "👏", "🎉", "🔥"];
       if (!allowed.includes(reaction)) return;
       io.to(room).emit("reaction", {
@@ -348,14 +448,185 @@ export function configureMeetingSocket(io) {
     });
 
     // ── Host announcement ────────────────────────────────────────────
-    socket.on("host-announcement", ({ meetingId, message } = {}) => {
+    socket.on("host-announcement", async ({ meetingId, message } = {}) => {
       const room = roomValue(meetingId);
       const text = typeof message === "string" ? message.trim() : "";
       if (!room || !text || socket.data.room !== room || socket.data.role !== "host") return;
+      if (!(await hasActiveMembership(socket, room))) return;
       socket.to(room).emit("host-announcement", {
         message: text.slice(0, 500),
         name: socket.data.name,
       });
+    });
+
+    socket.on("file-transfer-request", async (payload = {}) => {
+      const room = roomValue(payload.meetingId);
+      const fileName = typeof payload.fileName === "string" ? payload.fileName : "";
+      const mimeType = typeof payload.mimeType === "string" ? payload.mimeType : "";
+      const fileSize = payload.fileSize;
+      const totalChunks = payload.totalChunks;
+      const receiverId = typeof payload.receiverId === "string" ? payload.receiverId : "";
+      const transferId = typeof payload.transferId === "string" ? payload.transferId : "";
+      const target = io.sockets.sockets.get(receiverId);
+
+      if (
+        !room ||
+        socket.data.room !== room ||
+        socket.data.meetingAccess.meetingId !== room ||
+        !TRANSFER_ID_PATTERN.test(transferId) ||
+        !target ||
+        target.id === socket.id ||
+        target.data.room !== room ||
+        fileName.length < 1 ||
+        fileName.length > 255 ||
+        /[\\/\u0000-\u001f\u007f]/.test(fileName) ||
+        !Number.isSafeInteger(fileSize) ||
+        fileSize < 1 ||
+        fileSize > getMaxFileSize() ||
+        !MIME_TYPE_PATTERN.test(mimeType) ||
+        mimeType.length > 127 ||
+        totalChunks !== Math.ceil(fileSize / FILE_CHUNK_SIZE) ||
+        pendingTransfers.has(transferId)
+      ) {
+        socket.emit("file-transfer-failed", {
+          transferId: transferId || null,
+          message: "The file transfer request is invalid or unauthorized.",
+        });
+        return;
+      }
+
+      try {
+        if (
+          !(await hasActiveMembership(socket, room)) ||
+          !(await hasActiveMembership(target, room))
+        ) {
+          socket.emit("file-transfer-failed", {
+            transferId,
+            message: "File sharing is unavailable for this meeting.",
+          });
+          return;
+        }
+
+        const transfer = {
+          transferId,
+          meetingId: room,
+          senderId: socket.id,
+          receiverId,
+          fileName,
+          fileSize,
+          mimeType,
+          totalChunks,
+          senderName: socket.data.name,
+          state: "offered",
+        };
+        transfer.authorizationTimer = setTimeout(() => {
+          pendingTransfers.delete(transferId);
+          for (const peerId of [socket.id, target.id]) {
+            io.sockets.sockets.get(peerId)?.emit("file-transfer-failed", {
+              transferId,
+              message: "The recipient could not be reached.",
+            });
+          }
+        }, TRANSFER_AUTH_TIMEOUT_MS);
+        transfer.authorizationTimer.unref();
+        pendingTransfers.set(transferId, transfer);
+
+        socket.emit("file-transfer-authorized", { transferId, receiverId });
+        target.emit("file-transfer-offer", {
+          transferId,
+          meetingId: room,
+          fileName,
+          fileSize,
+          mimeType,
+          totalChunks,
+          senderId: socket.id,
+          senderName: socket.data.name,
+          receiverId,
+          timestamp: new Date().toISOString(),
+        });
+      } catch (error) {
+        console.error("[Socket] Failed to authorize file transfer:", error);
+        socket.emit("file-transfer-failed", {
+          transferId,
+          message: "The file transfer could not be authorized.",
+        });
+      }
+    });
+
+    socket.on("file-transfer-ready", async ({ meetingId, transferId } = {}) => {
+      const room = roomValue(meetingId);
+      const transfer = pendingTransfers.get(transferId);
+      if (
+        !room ||
+        socket.data.room !== room ||
+        !transfer ||
+        transfer.meetingId !== room ||
+        transfer.receiverId !== socket.id
+      ) {
+        return;
+      }
+      if (transfer.state !== "offered") return;
+      try {
+        if (!(await hasActiveMembership(socket, room))) return;
+        transfer.state = "ready";
+        clearTimeout(transfer.authorizationTimer);
+        transfer.authorizationTimer = setTimeout(() => {
+          pendingTransfers.delete(transferId);
+          for (const peerId of [transfer.senderId, transfer.receiverId]) {
+            io.sockets.sockets.get(peerId)?.emit("file-transfer-failed", {
+              transferId,
+              message: "The file transfer timed out.",
+            });
+          }
+        }, TRANSFER_LIFETIME_MS);
+        transfer.authorizationTimer.unref();
+        io.sockets.sockets.get(transfer.senderId)?.emit("file-transfer-ready", {
+          transferId,
+          receiverId: socket.id,
+        });
+      } catch (error) {
+        console.error("[Socket] Failed to approve file transfer:", error);
+      }
+    });
+
+    socket.on("file-transfer-cancel", ({ meetingId, transferId } = {}) => {
+      const room = roomValue(meetingId);
+      const transfer = pendingTransfers.get(transferId);
+      if (
+        !room ||
+        socket.data.room !== room ||
+        !transfer ||
+        transfer.meetingId !== room ||
+        (transfer.senderId !== socket.id && transfer.receiverId !== socket.id)
+      ) {
+        return;
+      }
+      clearTimeout(transfer.authorizationTimer);
+      pendingTransfers.delete(transferId);
+      const otherId = transfer.senderId === socket.id ? transfer.receiverId : transfer.senderId;
+      io.sockets.sockets.get(otherId)?.emit("file-transfer-cancelled", {
+        transferId,
+        cancelledBy: socket.id,
+      });
+    });
+
+    socket.on("file-transfer-finished", ({ meetingId, transferId } = {}) => {
+      const room = roomValue(meetingId);
+      const transfer = pendingTransfers.get(transferId);
+      if (
+        !room ||
+        socket.data.room !== room ||
+        !transfer ||
+        transfer.meetingId !== room ||
+        transfer.receiverId !== socket.id ||
+        transfer.state !== "ready"
+      ) {
+        return;
+      }
+      clearTimeout(transfer.authorizationTimer);
+      pendingTransfers.delete(transferId);
+      const otherId = transfer.senderId === socket.id ? transfer.receiverId : transfer.senderId;
+      io.sockets.sockets.get(otherId)?.emit("file-transfer-finished", { transferId });
     });
 
     // ── Disconnect ───────────────────────────────────────────────────
@@ -364,6 +635,7 @@ export function configureMeetingSocket(io) {
       const room = socket.data.room;
       console.info("[Socket] Disconnected", { socketId: socket.id, meetingId: room || null });
       if (room) {
+        removeTransfersForPeer(socket.id, room);
         const timer = setTimeout(() => {
           pendingDepartures.delete(socket.id);
           io.to(room).except(socket.id).emit("peer-left", {
